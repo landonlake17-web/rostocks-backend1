@@ -182,12 +182,34 @@ app.get("/trending", async (req, res) => {
 
 
 
+// Convert placeId to universeId
+async function placeToUniverse(placeId) {
+  try {
+    const res = await fetch(`https://apis.roblox.com/universes/v1/places?placeIds=${placeId}`, {
+      headers: { "Accept": "application/json" }
+    });
+    if (!res.ok) return placeId;
+    const json = await res.json();
+    const entry = (json.universeIds || [])[0];
+    return entry ? entry.universeId : placeId;
+  } catch(e) {
+    return placeId;
+  }
+}
+
 app.get("/game/:universeId", async (req, res) => {
-  const universeId = req.params.universeId;
+  let universeId = req.params.universeId;
   try {
     // Get base data from cache
     const games = await fetchGameData();
-    const base = games.find(g => g.universeId == universeId) || {};
+    const base = games.find(g => g.universeId == universeId || g.placeId == universeId) || {};
+
+    // If we have a placeId stored, convert it to real universeId for detail lookup
+    if (base.placeId && base.placeId != base.universeId) {
+      const realId = await placeToUniverse(base.placeId);
+      console.log(`[Detail] placeId ${base.placeId} -> universeId ${realId}`);
+      universeId = realId;
+    }
 
     // Fetch rich detail from Roblox API
     let detail = {};
@@ -198,10 +220,10 @@ app.get("/game/:universeId", async (req, res) => {
       if (detailRes.ok) {
         const dj = await detailRes.json();
         const g = (dj.data || [])[0] || {};
-        console.log(`[Detail] Raw for ${universeId}:`, JSON.stringify(g).substring(0, 300));
-        // genre returns "All" often — use gameGenre or sourceName instead
-        const genre = (g.genre && g.genre !== "All") ? g.genre : 
-                      (g.gameGenre || "—");
+        console.log(`[Detail] Raw for ${universeId}:`, JSON.stringify(g).substring(0, 400));
+        // Roblox genre is often "All" — check sourceName for real genre
+        const genre = (g.genre && g.genre !== "All") ? g.genre :
+                      (g.sourceName || "—");
         detail = {
           visits:         g.visits || 0,
           genre:          genre,
@@ -209,6 +231,8 @@ app.get("/game/:universeId", async (req, res) => {
           created:        g.created || "",
           maxPlayers:     g.maxPlayers || 0,
           favoritedCount: g.favoritedCount || 0,
+          upVotes:        g.upVotes || 0,
+          downVotes:      g.downVotes || 0,
         };
       } else {
         console.warn("[Detail] Roblox API status:", detailRes.status);
@@ -217,23 +241,25 @@ app.get("/game/:universeId", async (req, res) => {
       console.warn("[Detail] Roblox API error:", e.message);
     }
 
-    // Fetch votes
-    let likes = 0, dislikes = 0;
-    try {
-      const voteRes = await fetch(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`, {
-        headers: { "Accept": "application/json" }
-      });
-      if (voteRes.ok) {
-        const vj = await voteRes.json();
-        console.log(`[Votes] Raw:`, JSON.stringify(vj).substring(0, 200));
-        const v = (vj.data || [])[0] || {};
-        likes    = v.upVotes || 0;
-        dislikes = v.downVotes || 0;
-      } else {
-        console.warn("[Votes] Status:", voteRes.status);
+    // Use votes from games API if available, else try votes endpoint
+    let likes = detail.upVotes || 0;
+    let dislikes = detail.downVotes || 0;
+
+    if (likes === 0) {
+      try {
+        const voteRes = await fetch(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`, {
+          headers: { "Accept": "application/json" }
+        });
+        if (voteRes.ok) {
+          const vj = await voteRes.json();
+          console.log(`[Votes] Raw:`, JSON.stringify(vj).substring(0, 200));
+          const v = (vj.data || [])[0] || {};
+          likes    = v.upVotes || 0;
+          dislikes = v.downVotes || 0;
+        }
+      } catch(e) {
+        console.warn("[Detail] Votes API error:", e.message);
       }
-    } catch(e) {
-      console.warn("[Detail] Votes API error:", e.message);
     }
 
     const response = {
