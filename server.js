@@ -180,12 +180,63 @@ app.get("/trending", async (req, res) => {
   }
 });
 
+
+
 app.get("/game/:universeId", async (req, res) => {
+  const universeId = req.params.universeId;
   try {
+    // Get base data from cache
     const games = await fetchGameData();
-    const game = games.find(g => g.universeId == req.params.universeId);
-    if (!game) return res.status(404).json({ error: "Game not found" });
-    res.json(game);
+    const base = games.find(g => g.universeId == universeId) || {};
+
+    // Fetch rich detail from Roblox API (backend can call this freely)
+    let detail = {};
+    try {
+      const detailRes = await fetch(`https://games.roblox.com/v1/games?universeIds=${universeId}`, {
+        headers: { "Accept": "application/json" }
+      });
+      if (detailRes.ok) {
+        const dj = await detailRes.json();
+        const g = (dj.data || [])[0] || {};
+        detail = {
+          visits:    g.visits || 0,
+          genre:     g.genre || "—",
+          updated:   g.updated || "",
+          created:   g.created || "",
+          maxPlayers: g.maxPlayers || 0,
+          favoritedCount: g.favoritedCount || 0,
+        };
+      }
+    } catch(e) {
+      console.warn("[Detail] Roblox API error:", e.message);
+    }
+
+    // Fetch votes
+    let likes = 0, dislikes = 0;
+    try {
+      const voteRes = await fetch(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`, {
+        headers: { "Accept": "application/json" }
+      });
+      if (voteRes.ok) {
+        const vj = await voteRes.json();
+        const v = (vj.data || [])[0] || {};
+        likes    = v.upVotes || 0;
+        dislikes = v.downVotes || 0;
+      }
+    } catch(e) {
+      console.warn("[Detail] Votes API error:", e.message);
+    }
+
+    res.json({
+      ...base,
+      visits:   detail.visits || base.visits || 0,
+      genre:    detail.genre || "—",
+      updated:  detail.updated || "",
+      created:  detail.created || "",
+      likes:    likes,
+      dislikes: dislikes,
+      favoritedCount: detail.favoritedCount || 0,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
