@@ -189,7 +189,7 @@ app.get("/game/:universeId", async (req, res) => {
     const games = await fetchGameData();
     const base = games.find(g => g.universeId == universeId) || {};
 
-    // Fetch rich detail from Roblox API (backend can call this freely)
+    // Fetch rich detail from Roblox API
     let detail = {};
     try {
       const detailRes = await fetch(`https://games.roblox.com/v1/games?universeIds=${universeId}`, {
@@ -198,14 +198,20 @@ app.get("/game/:universeId", async (req, res) => {
       if (detailRes.ok) {
         const dj = await detailRes.json();
         const g = (dj.data || [])[0] || {};
+        console.log(`[Detail] Raw for ${universeId}:`, JSON.stringify(g).substring(0, 300));
+        // genre returns "All" often — use gameGenre or sourceName instead
+        const genre = (g.genre && g.genre !== "All") ? g.genre : 
+                      (g.gameGenre || "—");
         detail = {
-          visits:    g.visits || 0,
-          genre:     g.genre || "—",
-          updated:   g.updated || "",
-          created:   g.created || "",
-          maxPlayers: g.maxPlayers || 0,
+          visits:         g.visits || 0,
+          genre:          genre,
+          updated:        g.updated || "",
+          created:        g.created || "",
+          maxPlayers:     g.maxPlayers || 0,
           favoritedCount: g.favoritedCount || 0,
         };
+      } else {
+        console.warn("[Detail] Roblox API status:", detailRes.status);
       }
     } catch(e) {
       console.warn("[Detail] Roblox API error:", e.message);
@@ -219,24 +225,29 @@ app.get("/game/:universeId", async (req, res) => {
       });
       if (voteRes.ok) {
         const vj = await voteRes.json();
+        console.log(`[Votes] Raw:`, JSON.stringify(vj).substring(0, 200));
         const v = (vj.data || [])[0] || {};
         likes    = v.upVotes || 0;
         dislikes = v.downVotes || 0;
+      } else {
+        console.warn("[Votes] Status:", voteRes.status);
       }
     } catch(e) {
       console.warn("[Detail] Votes API error:", e.message);
     }
 
-    res.json({
+    const response = {
       ...base,
-      visits:   detail.visits || base.visits || 0,
-      genre:    detail.genre || "—",
-      updated:  detail.updated || "",
-      created:  detail.created || "",
-      likes:    likes,
-      dislikes: dislikes,
+      visits:         detail.visits || base.visits || 0,
+      genre:          detail.genre || "—",
+      updated:        detail.updated || "",
+      created:        detail.created || "",
+      likes:          likes,
+      dislikes:       dislikes,
       favoritedCount: detail.favoritedCount || 0,
-    });
+    };
+    console.log(`[Detail] Sending: visits=${response.visits} likes=${likes} dislikes=${dislikes} genre=${response.genre}`);
+    res.json(response);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
