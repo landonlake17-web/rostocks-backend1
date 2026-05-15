@@ -1,86 +1,84 @@
-// RoStocks Backend Server
-// Uses Rolimons API (free, no key needed) to get real top games by CCU
-// Deploy on Railway (free) at railway.app
-
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.use(express.json());
 
 let cachedData = null;
 let lastFetch = 0;
-const CACHE_MS = 10 * 60 * 1000; // 10 minutes
+const CACHE_MS = 10 * 60 * 1000;
 
-// -------------------------------------------------------
-// Fetch top games from Rolimons (returns all tracked games with live CCU)
-// Then fetch details from Roblox games API for visits/creator info
-// -------------------------------------------------------
+// Convert place IDs to universe IDs in batches
+async function convertPlaceIdsToUniverseIds(placeIds) {
+  const map = {};
+  try {
+    // Roblox allows up to 100 place IDs per request
+    const chunks = [];
+    for (let i = 0; i < placeIds.length; i += 100) {
+      chunks.push(placeIds.slice(i, i + 100));
+    }
+    for (const chunk of chunks) {
+      const res = await fetch(
+        `https://apis.roblox.com/universes/v1/places?placeIds=${chunk.join(",")}`,
+        { headers: { "Accept": "application/json" } }
+      );
+      if (res.ok) {
+        const json = await res.json();
+        (json.universeIds || []).forEach(entry => {
+          if (entry.placeId && entry.universeId) {
+            map[entry.placeId] = entry.universeId;
+          }
+        });
+      }
+    }
+  } catch(e) {
+    console.warn("[Convert] Place->Universe failed:", e.message);
+  }
+  return map;
+}
+
 async function fetchGameData() {
   const now = Date.now();
   if (cachedData && (now - lastFetch) < CACHE_MS) {
-    console.log("[Cache] Returning cached data");
     return cachedData;
   }
 
-  console.log("[Fetch] Pulling games from Rolimons...");
+  console.log("[Fetch] Pulling from Rolimons...");
 
   try {
-    // Step 1: Get all games from Rolimons (includes live player count)
     const roliRes = await fetch("https://api.rolimons.com/games/v1/gamelist", {
       headers: { "Accept": "application/json", "User-Agent": "RoStocks/1.0" }
     });
-
-    if (!roliRes.ok) throw new Error(`Rolimons API returned ${roliRes.status}`);
+    if (!roliRes.ok) throw new Error(`Rolimons returned ${roliRes.status}`);
 
     const roliJson = await roliRes.json();
-    if (!roliJson.success || !roliJson.games) throw new Error("Rolimons returned no games");
+    if (!roliJson.success || !roliJson.games) throw new Error("No games from Rolimons");
 
-    // roliJson.games is an object: { "placeId": [name, ccu, thumbnailUrl], ... }
-    const entries = Object.entries(roliJson.games);
-
-    // Sort by CCU descending, take top 100
-    const sorted = entries
+    // Sort by CCU, take top 100
+    const sorted = Object.entries(roliJson.games)
       .map(([placeId, data]) => ({
-        placeId:  parseInt(placeId),
-        name:     data[0],
-        ccuRaw:   data[1] || 0,
+        placeId:   parseInt(placeId),
+        name:      data[0],
+        ccuRaw:    data[1] || 0,
         thumbnail: data[2] || "",
       }))
       .filter(g => g.ccuRaw > 0 && g.name)
       .sort((a, b) => b.ccuRaw - a.ccuRaw)
       .slice(0, 100);
 
-    // Step 2: Get universe IDs from place IDs so we can fetch creator info
-    // Batch in groups of 100
-    const placeIds = sorted.map(g => g.placeId).join(",");
-    let universeMap = {};
+    // Convert all place IDs to universe IDs
+    console.log("[Fetch] Converting place IDs to universe IDs...");
+    const placeIds = sorted.map(g => g.placeId);
+    const uniMap = await convertPlaceIdsToUniverseIds(placeIds);
+    console.log(`[Fetch] Converted ${Object.keys(uniMap).length} IDs`);
 
-    try {
-      const uniRes = await fetch(`https://apis.roblox.com/universes/v1/places?placeIds=${placeIds}`, {
-        headers: { "Accept": "application/json" }
-      });
-      if (uniRes.ok) {
-        const uniJson = await uniRes.json();
-        (uniJson.universeIds || []).forEach((entry) => {
-          if (entry.placeId && entry.universeId) {
-            universeMap[entry.placeId] = entry.universeId;
-          }
-        });
-      }
-    } catch(e) {
-      console.warn("[Fetch] Universe ID lookup failed, skipping:", e.message);
-    }
-
-    // Step 3: Build final mapped array
     const mapped = sorted.map((g, i) => {
-      const universeId = universeMap[g.placeId] || g.placeId;
+      const universeId = uniMap[g.placeId] || g.placeId;
       return {
         rank:       i + 1,
-        universeId: universeId,
         placeId:    g.placeId,
+        universeId: universeId,
         name:       g.name,
-        creator:    "@Unknown", // filled below if universe lookup worked
+        creator:    "@Unknown",
         ccu:        formatCCU(g.ccuRaw),
         ccuRaw:     g.ccuRaw,
         price:      calculateSharePrice(g.ccuRaw),
@@ -89,45 +87,40 @@ async function fetchGameData() {
       };
     });
 
-    // Step 4: Fetch creator names using universe IDs (batched)
-    const universeIds = mapped.map(g => g.universeId).filter(Boolean).slice(0, 100);
+    // Fetch creator names using real universe IDs
+    const universeIds = mapped.map(g => g.universeId).filter(Boolean);
     try {
-      const detailRes = await fetch(`https://games.roblox.com/v1/games?universeIds=${universeIds.join(",")}`, {
-        headers: { "Accept": "application/json" }
-      });
+      const detailRes = await fetch(
+        `https://games.roblox.com/v1/games?universeIds=${universeIds.slice(0,50).join(",")}`,
+        { headers: { "Accept": "application/json" } }
+      );
       if (detailRes.ok) {
-        const detailJson = await detailRes.json();
+        const dj = await detailRes.json();
         const detailMap = {};
-        (detailJson.data || []).forEach(d => { detailMap[d.id] = d; });
+        (dj.data || []).forEach(d => { detailMap[d.id] = d; });
         mapped.forEach(g => {
-          const detail = detailMap[g.universeId];
-          if (detail?.creator?.name) {
-            g.creator = "@" + detail.creator.name;
-          }
+          const d = detailMap[g.universeId];
+          if (d?.creator?.name) g.creator = "@" + d.creator.name;
         });
       }
     } catch(e) {
-      console.warn("[Fetch] Creator name lookup failed:", e.message);
+      console.warn("[Fetch] Creator fetch failed:", e.message);
     }
 
     cachedData = mapped;
     lastFetch = now;
-    console.log(`[Fetch] Done. Top game: ${mapped[0]?.name} (${mapped[0]?.ccu} CCU)`);
+    console.log(`[Fetch] Done. Top: ${mapped[0]?.name} (${mapped[0]?.ccu})`);
     return mapped;
 
-  } catch (err) {
+  } catch(err) {
     console.error("[Fetch] Error:", err.message);
-    if (cachedData) {
-      console.log("[Fetch] Returning stale cache");
-      return cachedData;
-    }
+    if (cachedData) return cachedData;
     throw err;
   }
 }
 
 function calculateSharePrice(ccu) {
-  const base = Math.round(ccu * 0.0002);
-  return Math.min(Math.max(base, 10), 10000);
+  return Math.min(Math.max(Math.round(ccu * 0.0002), 10), 10000);
 }
 
 function simulatePriceChange(id) {
@@ -139,8 +132,8 @@ function simulatePriceChange(id) {
 
 function formatCCU(n) {
   if (!n) return "0";
-  if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
-  if (n >= 1000)    return Math.round(n / 1000) + "K";
+  if (n >= 1000000) return (n/1000000).toFixed(2)+"M";
+  if (n >= 1000)    return Math.round(n/1000)+"K";
   return n.toString();
 }
 
@@ -151,7 +144,7 @@ function getTrending(games) {
     .slice(0, 20)
     .map(g => ({
       ...g,
-      ccuGain:  "+" + formatCCU(Math.floor(g.ccuRaw * 0.08)),
+      ccuGain:  "+"+formatCCU(Math.floor(g.ccuRaw * 0.08)),
       momentum: Math.min(g.change / 15, 1).toFixed(2),
       tag:      g.change > 10 ? "Hot" : g.rank > 50 ? "New" : "",
     }));
@@ -159,126 +152,70 @@ function getTrending(games) {
 
 // Routes
 app.get("/", (req, res) => {
-  res.json({ status: "RoStocks backend running", time: new Date().toISOString() });
+  res.json({ status: "RoStocks running", time: new Date().toISOString() });
 });
 
 app.get("/top100", async (req, res) => {
   try {
     const games = await fetchGameData();
     res.json({ games: games.slice(0, 100) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/trending", async (req, res) => {
   try {
     const games = await fetchGameData();
     res.json({ games: getTrending(games) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-
-
-// Convert placeId to universeId
-async function placeToUniverse(placeId) {
+app.get("/game/:id", async (req, res) => {
   try {
-    const res = await fetch(`https://apis.roblox.com/universes/v1/places?placeIds=${placeId}`, {
-      headers: { "Accept": "application/json" }
-    });
-    if (!res.ok) return placeId;
-    const json = await res.json();
-    const entry = (json.universeIds || [])[0];
-    return entry ? entry.universeId : placeId;
-  } catch(e) {
-    return placeId;
-  }
-}
-
-app.get("/game/:universeId", async (req, res) => {
-  let universeId = req.params.universeId;
-  try {
-    // Get base data from cache
+    const id = parseInt(req.params.id);
     const games = await fetchGameData();
-    const base = games.find(g => g.universeId == universeId || g.placeId == universeId) || {};
+    const base = games.find(g => g.universeId == id || g.placeId == id) || {};
+    const universeId = base.universeId || id;
 
-    // If we have a placeId stored, convert it to real universeId for detail lookup
-    if (base.placeId && base.placeId != base.universeId) {
-      const realId = await placeToUniverse(base.placeId);
-      console.log(`[Detail] placeId ${base.placeId} -> universeId ${realId}`);
-      universeId = realId;
-    }
+    console.log(`[Detail] Fetching universeId: ${universeId} (input: ${id})`);
 
-    // Fetch rich detail from Roblox API
-    let detail = {};
+    // Fetch detail from Roblox
+    let visits = 0, genre = "—", updated = "", likes = 0, dislikes = 0;
     try {
-      const detailRes = await fetch(`https://games.roblox.com/v1/games?universeIds=${universeId}`, {
-        headers: { "Accept": "application/json" }
-      });
-      if (detailRes.ok) {
-        const dj = await detailRes.json();
-        const g = (dj.data || [])[0] || {};
-        console.log(`[Detail] Raw for ${universeId}:`, JSON.stringify(g).substring(0, 400));
-        // Roblox genre is often "All" — check sourceName for real genre
-        const genre = (g.genre && g.genre !== "All") ? g.genre :
-                      (g.sourceName || "—");
-        detail = {
-          visits:         g.visits || 0,
-          genre:          genre,
-          updated:        g.updated || "",
-          created:        g.created || "",
-          maxPlayers:     g.maxPlayers || 0,
-          favoritedCount: g.favoritedCount || 0,
-          upVotes:        g.upVotes || 0,
-          downVotes:      g.downVotes || 0,
-        };
-      } else {
-        console.warn("[Detail] Roblox API status:", detailRes.status);
+      const dr = await fetch(
+        `https://games.roblox.com/v1/games?universeIds=${universeId}`,
+        { headers: { "Accept": "application/json" } }
+      );
+      if (dr.ok) {
+        const dj = await dr.json();
+        const g = (dj.data||[])[0] || {};
+        console.log(`[Detail] name=${g.name} visits=${g.visits} genre=${g.genre}`);
+        visits  = g.visits || 0;
+        genre   = (g.genre && g.genre !== "All") ? g.genre : "—";
+        updated = g.updated || "";
+        likes   = g.upVotes || 0;
+        dislikes= g.downVotes || 0;
       }
-    } catch(e) {
-      console.warn("[Detail] Roblox API error:", e.message);
-    }
+    } catch(e) { console.warn("[Detail] API error:", e.message); }
 
-    // Use votes from games API if available, else try votes endpoint
-    let likes = detail.upVotes || 0;
-    let dislikes = detail.downVotes || 0;
-
+    // Try votes endpoint if no votes yet
     if (likes === 0) {
       try {
-        const voteRes = await fetch(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`, {
-          headers: { "Accept": "application/json" }
-        });
-        if (voteRes.ok) {
-          const vj = await voteRes.json();
-          console.log(`[Votes] Raw:`, JSON.stringify(vj).substring(0, 200));
-          const v = (vj.data || [])[0] || {};
+        const vr = await fetch(
+          `https://games.roblox.com/v1/games/votes?universeIds=${universeId}`,
+          { headers: { "Accept": "application/json" } }
+        );
+        if (vr.ok) {
+          const vj = await vr.json();
+          const v = (vj.data||[])[0] || {};
           likes    = v.upVotes || 0;
           dislikes = v.downVotes || 0;
         }
-      } catch(e) {
-        console.warn("[Detail] Votes API error:", e.message);
-      }
+      } catch(e) {}
     }
 
-    const response = {
-      ...base,
-      visits:         detail.visits || base.visits || 0,
-      genre:          detail.genre || "—",
-      updated:        detail.updated || "",
-      created:        detail.created || "",
-      likes:          likes,
-      dislikes:       dislikes,
-      favoritedCount: detail.favoritedCount || 0,
-    };
-    console.log(`[Detail] Sending: visits=${response.visits} likes=${likes} dislikes=${dislikes} genre=${response.genre}`);
-    res.json(response);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    console.log(`[Detail] Result: visits=${visits} likes=${likes} dislikes=${dislikes} genre=${genre}`);
+    res.json({ ...base, visits, genre, updated, likes, dislikes });
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-app.listen(PORT, () => {
-  console.log(`[RoStocks] Backend running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`[RoStocks] Running on port ${PORT}`));
