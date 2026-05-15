@@ -1,5 +1,5 @@
 // RoStocks Backend Server
-// Fetches real top 100 games dynamically from Roblox's public API
+// Uses Rolimons API (free, no key needed) to get real top games by CCU
 // Deploy on Railway (free) at railway.app
 
 const express = require("express");
@@ -10,8 +10,12 @@ app.use(express.json());
 
 let cachedData = null;
 let lastFetch = 0;
-const CACHE_MS = 10 * 60 * 1000;
+const CACHE_MS = 10 * 60 * 1000; // 10 minutes
 
+// -------------------------------------------------------
+// Fetch top games from Rolimons (returns all tracked games with live CCU)
+// Then fetch details from Roblox games API for visits/creator info
+// -------------------------------------------------------
 async function fetchGameData() {
   const now = Date.now();
   if (cachedData && (now - lastFetch) < CACHE_MS) {
@@ -19,66 +23,116 @@ async function fetchGameData() {
     return cachedData;
   }
 
-  console.log("[Fetch] Pulling top games from Roblox API...");
+  console.log("[Fetch] Pulling games from Rolimons...");
 
   try {
-    const listUrl = "https://games.roblox.com/v1/games/list?sortToken=&gameFilter=default&startRows=0&maxRows=100&browserFilter=default&SortType=1&sortOrder=0";
-    const listRes = await fetch(listUrl, { headers: { "Accept": "application/json" } });
-
-    if (!listRes.ok) throw new Error(`Games list API returned ${listRes.status}`);
-
-    const listJson = await listRes.json();
-    const gameList = listJson.games || [];
-
-    if (gameList.length === 0) throw new Error("No games returned from Roblox API");
-
-    const universeIds = gameList.map(g => g.universeId).filter(Boolean);
-
-    const detailRes = await fetch(`https://games.roblox.com/v1/games?universeIds=${universeIds.join(",")}`, {
-      headers: { "Accept": "application/json" }
+    // Step 1: Get all games from Rolimons (includes live player count)
+    const roliRes = await fetch("https://api.rolimons.com/games/v1/gamelist", {
+      headers: { "Accept": "application/json", "User-Agent": "RoStocks/1.0" }
     });
 
-    const detailJson = detailRes.ok ? await detailRes.json() : { data: [] };
-    const detailMap = {};
-    (detailJson.data || []).forEach(d => { detailMap[d.id] = d; });
+    if (!roliRes.ok) throw new Error(`Rolimons API returned ${roliRes.status}`);
 
-    const mapped = gameList.map((g, i) => {
-      const detail = detailMap[g.universeId] || {};
-      const ccu    = g.playerCount || detail.playing || 0;
-      const visits = detail.visits || 0;
+    const roliJson = await roliRes.json();
+    if (!roliJson.success || !roliJson.games) throw new Error("Rolimons returned no games");
+
+    // roliJson.games is an object: { "placeId": [name, ccu, thumbnailUrl], ... }
+    const entries = Object.entries(roliJson.games);
+
+    // Sort by CCU descending, take top 100
+    const sorted = entries
+      .map(([placeId, data]) => ({
+        placeId:  parseInt(placeId),
+        name:     data[0],
+        ccuRaw:   data[1] || 0,
+        thumbnail: data[2] || "",
+      }))
+      .filter(g => g.ccuRaw > 0 && g.name)
+      .sort((a, b) => b.ccuRaw - a.ccuRaw)
+      .slice(0, 100);
+
+    // Step 2: Get universe IDs from place IDs so we can fetch creator info
+    // Batch in groups of 100
+    const placeIds = sorted.map(g => g.placeId).join(",");
+    let universeMap = {};
+
+    try {
+      const uniRes = await fetch(`https://apis.roblox.com/universes/v1/places?placeIds=${placeIds}`, {
+        headers: { "Accept": "application/json" }
+      });
+      if (uniRes.ok) {
+        const uniJson = await uniRes.json();
+        (uniJson.universeIds || []).forEach((entry) => {
+          if (entry.placeId && entry.universeId) {
+            universeMap[entry.placeId] = entry.universeId;
+          }
+        });
+      }
+    } catch(e) {
+      console.warn("[Fetch] Universe ID lookup failed, skipping:", e.message);
+    }
+
+    // Step 3: Build final mapped array
+    const mapped = sorted.map((g, i) => {
+      const universeId = universeMap[g.placeId] || g.placeId;
       return {
         rank:       i + 1,
-        universeId: g.universeId,
-        name:       g.name || detail.name || "Unknown",
-        creator:    "@" + (g.creatorName || detail.creator?.name || "Unknown"),
-        ccu:        formatCCU(ccu),
-        ccuRaw:     ccu,
-        visits:     visits,
-        price:      calculateSharePrice(ccu, visits),
-        change:     simulatePriceChange(g.universeId),
+        universeId: universeId,
+        placeId:    g.placeId,
+        name:       g.name,
+        creator:    "@Unknown", // filled below if universe lookup worked
+        ccu:        formatCCU(g.ccuRaw),
+        ccuRaw:     g.ccuRaw,
+        price:      calculateSharePrice(g.ccuRaw),
+        change:     simulatePriceChange(universeId),
+        thumbnail:  g.thumbnail,
       };
-    }).filter(g => g.name !== "Unknown");
+    });
+
+    // Step 4: Fetch creator names using universe IDs (batched)
+    const universeIds = mapped.map(g => g.universeId).filter(Boolean).slice(0, 100);
+    try {
+      const detailRes = await fetch(`https://games.roblox.com/v1/games?universeIds=${universeIds.join(",")}`, {
+        headers: { "Accept": "application/json" }
+      });
+      if (detailRes.ok) {
+        const detailJson = await detailRes.json();
+        const detailMap = {};
+        (detailJson.data || []).forEach(d => { detailMap[d.id] = d; });
+        mapped.forEach(g => {
+          const detail = detailMap[g.universeId];
+          if (detail?.creator?.name) {
+            g.creator = "@" + detail.creator.name;
+          }
+        });
+      }
+    } catch(e) {
+      console.warn("[Fetch] Creator name lookup failed:", e.message);
+    }
 
     cachedData = mapped;
     lastFetch = now;
-    console.log(`[Fetch] Got ${mapped.length} games, top: ${mapped[0]?.name}`);
+    console.log(`[Fetch] Done. Top game: ${mapped[0]?.name} (${mapped[0]?.ccu} CCU)`);
     return mapped;
 
   } catch (err) {
     console.error("[Fetch] Error:", err.message);
-    if (cachedData) return cachedData;
+    if (cachedData) {
+      console.log("[Fetch] Returning stale cache");
+      return cachedData;
+    }
     throw err;
   }
 }
 
-function calculateSharePrice(ccu, visits) {
-  const base = Math.round(ccu * 0.0002 + visits * 0.000000005);
+function calculateSharePrice(ccu) {
+  const base = Math.round(ccu * 0.0002);
   return Math.min(Math.max(base, 10), 10000);
 }
 
-function simulatePriceChange(universeId) {
+function simulatePriceChange(id) {
   const hour = new Date().getHours();
-  const seed = (universeId % 100) + hour;
+  const seed = (id % 100) + hour;
   const raw  = ((seed * 9301 + 49297) % 233280) / 233280;
   return parseFloat(((raw * 20) - 8).toFixed(1));
 }
@@ -103,6 +157,7 @@ function getTrending(games) {
     }));
 }
 
+// Routes
 app.get("/", (req, res) => {
   res.json({ status: "RoStocks backend running", time: new Date().toISOString() });
 });
